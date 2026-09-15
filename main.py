@@ -236,17 +236,20 @@ async def live_handler(event):
 
 async def catch_up():
     last_id = load_last_id()
+
     if last_id == 0:
-        latest = await client.get_messages(SOURCE_CHANNEL, limit=1)
-        if latest:
-            new_last_id = max(latest[0].id - 5, 0)
-            save_last_id(new_last_id)
-            log.info(f"أول تشغيل: بدء من last_id={new_last_id} (آخر 5 منشورات + الجديد فقط).")
+        # أول تشغيل على الإطلاق: انشر آخر 5 منشورات فعلياً (بالترتيب الزمني الصحيح)
+        messages = await client.get_messages(SOURCE_CHANNEL, limit=5)
+        if messages:
+            log.info(f"أول تشغيل: نشر آخر {len(messages)} منشورات من قناة المصدر.")
+        for msg in reversed(messages):
+            await handle_message(msg)
         return
 
+    # التشغيلات اللاحقة: فقط المنشورات الجديدة بعد آخر last_id محفوظ (بدون تكرار)
     messages = await client.get_messages(SOURCE_CHANNEL, min_id=last_id, limit=50)
     if messages:
-        log.info(f"اللحاق بـ {len(messages)} رسالة فائتة.")
+        log.info(f"اللحاق بـ {len(messages)} رسالة فائتة (جديدة بعد last_id={last_id}).")
     for msg in reversed(messages):
         await handle_message(msg)
 
