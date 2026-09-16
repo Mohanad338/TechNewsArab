@@ -20,6 +20,7 @@ CHANNEL_HANDLE_FOR_CAPTION = "@TechNewsArab"
 STATE_FILE = "last_id.json"
 MAX_RUNTIME_SECONDS = 5 * 3600 + 40 * 60   # 5 ساعات و40 دقيقة
 MAX_BOT_UPLOAD_BYTES = 49 * 1024 * 1024    # هامش أمان تحت حد الـ50 ميجا لـ Bot API
+ALBUM_WAIT_SECONDS = 2.5                   # مهلة انتظار لتجميع بقية صور/فيديوهات نفس الألبوم
 
 # ---------- أسرار من البيئة (GitHub Secrets) ----------
 TG_API_ID = int(os.environ["TG_API_ID"])
@@ -35,6 +36,10 @@ GEMINI_URL = (
 )
 
 client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
+
+# تجميع رسائل الألبومات الحية (grouped_id -> list[Message]) قبل معالجتها كوحدة واحدة
+_pending_albums = {}
+_pending_albums_lock = asyncio.Lock()
 
 
 # ================= حالة last_id (محفوظة بالمستودع) =================
@@ -153,6 +158,44 @@ def send_via_bot_api(media_type: str, file_path: str, caption: str):
         raise RuntimeError(f"Bot API رفض {endpoint}: {j}")
 
 
+def send_media_group_via_bot_api(items: list):
+    """
+    ينشر عدة صور/فيديوهات كمنشور واحد (ألبوم) عبر sendMediaGroup.
+    items: قائمة من dict لكل عنصر: {"type": "photo"|"video", "path": file_path}
+    الكابشن يُوضع فقط على أول عنصر (Telegram يعرضه كنص المنشور بالألبوم كامل).
+    """
+    media_payload = []
+    files = {}
+    open_files = []
+    try:
+        for i, item in enumerate(items):
+            attach_name = f"file{i}"
+            f = open(item["path"], "rb")
+            open_files.append(f)
+            files[attach_name] = f
+            entry = {"type": item["type"], "media": f"attach://{attach_name}"}
+            if i == 0 and item.get("caption"):
+                entry["caption"] = item["caption"]
+            media_payload.append(entry)
+
+        resp = requests.post(
+            f"{BOT_API_BASE}/sendMediaGroup",
+            data={"chat_id": TARGET_CHANNEL, "media": json.dumps(media_payload)},
+            files=files,
+            timeout=300,
+        )
+        resp.raise_for_status()
+        j = resp.json()
+        if not j.get("ok"):
+            raise RuntimeError(f"Bot API رفض sendMediaGroup: {j}")
+    finally:
+        for f in open_files:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
 async def forward_large(msg, caption: str):
     fwd = await client.forward_messages(
         entity=TARGET_CHANNEL,
@@ -165,6 +208,21 @@ async def forward_large(msg, caption: str):
         await client.edit_message(TARGET_CHANNEL, target_msg, text=caption, link_preview=False)
     except Exception as e:
         log.warning(f"تعذر تعديل الكابشن بعد forward (الرسالة نشرت بدون تعديل النص): {e}")
+
+
+async def forward_album_large(messages: list, caption: str):
+    """فورورد لألبوم كامل دفعة وحدة (لو فيه ملف كبير يتجاوز حد Bot API)."""
+    fwd = await client.forward_messages(
+        entity=TARGET_CHANNEL,
+        messages=messages,
+        from_peer=SOURCE_CHANNEL,
+        drop_author=True,
+    )
+    try:
+        target_msg = fwd[0] if isinstance(fwd, list) else fwd
+        await client.edit_message(TARGET_CHANNEL, target_msg, text=caption, link_preview=False)
+    except Exception as e:
+        log.warning(f"تعذر تعديل الكابشن بعد forward الألبوم (نشر بدون تعديل النص): {e}")
 
 
 async def send_media_or_forward(msg, media_type: str, caption: str):
@@ -196,7 +254,59 @@ async def send_media_or_forward(msg, media_type: str, caption: str):
                 pass
 
 
-# ================= معالجة رسالة واحدة =================
+async def send_album_or_forward(messages: list, caption: str):
+    """
+    يعالج ألبوم (أكثر من صورة/فيديو بمنشور وحد) كوحدة واحدة:
+    - لو كل الملفات ضمن حد Bot API: يحمّلها وينشرها دفعة وحدة عبر sendMediaGroup.
+    - لو فيه ملف كبير يتجاوز الحد، أو صار خطأ بالتحميل/الرفع: فورورد للألبوم كامل مع drop_author.
+    """
+    # تحقق من الأحجام أولاً
+    total_oversized = False
+    for m in messages:
+        try:
+            if m.file and m.file.size and m.file.size > MAX_BOT_UPLOAD_BYTES:
+                total_oversized = True
+                break
+        except Exception:
+            pass
+
+    if total_oversized:
+        log.info("ألبوم فيه ملف يتجاوز حد الحجم — استخدام forward للألبوم كامل.")
+        await forward_album_large(messages, caption)
+        return
+
+    downloaded_paths = []
+    try:
+        items = []
+        for m in messages:
+            if m.photo:
+                media_type = "photo"
+            elif m.video:
+                media_type = "video"
+            else:
+                # لو فيه عنصر بالألبوم مو صورة ولا فيديو (نادر)، أسهل حل آمن: فورورد الألبوم كامل
+                raise RuntimeError(f"عنصر بالألبوم برسالة {m.id} ليس صورة ولا فيديو مدعوم بـ sendMediaGroup")
+
+            path = await client.download_media(m, file="/tmp/relay_download")
+            if path is None:
+                raise RuntimeError(f"تعذر تحميل عنصر الألبوم برسالة {m.id}")
+            downloaded_paths.append(path)
+            items.append({"type": media_type, "path": path, "caption": caption if len(items) == 0 else None})
+
+        send_media_group_via_bot_api(items)
+    except Exception as e:
+        log.warning(f"فشل تحميل/رفع الألبوم عبر Bot API ({e}) — تجربة forward للألبوم كامل.")
+        await forward_album_large(messages, caption)
+    finally:
+        for p in downloaded_paths:
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+
+# ================= معالجة رسالة واحدة (بدون ألبوم) =================
 async def handle_message(msg):
     text = msg.raw_text or ""
     result = gemini_process(text)
@@ -225,13 +335,79 @@ async def handle_message(msg):
     log.info(f"تم نشر الرسالة {msg.id}.")
 
 
+# ================= معالجة ألبوم (أكثر من صورة/فيديو بمنشور واحد) =================
+async def handle_album(messages: list):
+    """
+    messages: كل رسائل الألبوم (لها نفس grouped_id)، بترتيب تصاعدي حسب id.
+    ينشرهم كمنشور واحد بالهدف، ويحدّث last_id لأعلى id بالألبوم دفعة وحدة.
+    """
+    messages = sorted(messages, key=lambda m: m.id)
+    max_id = messages[-1].id
+
+    # النص المرافق للألبوم يكون عادة على أحد عناصره (غالباً الأول) - نجمع أي نص موجود
+    combined_text = ""
+    for m in messages:
+        if m.raw_text and m.raw_text.strip():
+            combined_text = m.raw_text.strip()
+            break
+
+    result = gemini_process(combined_text)
+
+    if result["is_ad"]:
+        log.info(f"تجاهل إعلان (ألبوم برسائل {[m.id for m in messages]}).")
+        save_last_id(max_id)
+        return
+
+    caption = build_caption(result["arabic_text"])
+
+    try:
+        # لو ألبوم فيه عناصر غير صور/فيديو (نادر)، send_album_or_forward يرجع forward تلقائياً
+        media_messages = [m for m in messages if m.photo or m.video]
+        non_media_messages = [m for m in messages if not (m.photo or m.video)]
+
+        if media_messages and not non_media_messages:
+            await send_album_or_forward(media_messages, caption)
+        else:
+            # حالة نادرة: ألبوم فيه مستندات/صوتيات ضمنه - أسلم حل فورورد كامل الألبوم
+            log.info(f"ألبوم برسائل {[m.id for m in messages]} فيه عناصر غير مدعومة بـ sendMediaGroup — forward كامل.")
+            await forward_album_large(messages, caption)
+    except Exception as e:
+        log.error(f"فشل نشر الألبوم {[m.id for m in messages]}: {e} — لن يتم تحديث last_id، سيعاد المحاولة لاحقاً.")
+        return
+
+    save_last_id(max_id)
+    log.info(f"تم نشر الألبوم (رسائل {[m.id for m in messages]}) كمنشور واحد.")
+
+
+# ================= تجميع رسائل الألبوم الحية قبل المعالجة =================
+async def _flush_album_after_delay(grouped_id):
+    await asyncio.sleep(ALBUM_WAIT_SECONDS)
+    async with _pending_albums_lock:
+        messages = _pending_albums.pop(grouped_id, None)
+    if not messages:
+        return
+    try:
+        await handle_album(messages)
+    except Exception as e:
+        log.error(f"خطأ بمعالجة ألبوم حي (grouped_id={grouped_id}): {e}")
+
+
 # ================= الاستماع المباشر + اللحاق بالفائت =================
 @client.on(events.NewMessage(chats=SOURCE_CHANNEL))
 async def live_handler(event):
+    msg = event.message
     try:
-        await handle_message(event.message)
+        if msg.grouped_id:
+            # جزء من ألبوم: أضفه لقائمة الانتظار، وابدأ مؤقّت التجميع لأول رسالة بالألبوم فقط
+            async with _pending_albums_lock:
+                is_first = msg.grouped_id not in _pending_albums
+                _pending_albums.setdefault(msg.grouped_id, []).append(msg)
+            if is_first:
+                asyncio.create_task(_flush_album_after_delay(msg.grouped_id))
+        else:
+            await handle_message(msg)
     except Exception as e:
-        log.error(f"خطأ بمعالجة رسالة حية {event.message.id}: {e}")
+        log.error(f"خطأ بمعالجة رسالة حية {msg.id}: {e}")
 
 
 async def catch_up():
@@ -242,16 +418,37 @@ async def catch_up():
         messages = await client.get_messages(SOURCE_CHANNEL, limit=5)
         if messages:
             log.info(f"أول تشغيل: نشر آخر {len(messages)} منشورات من قناة المصدر.")
-        for msg in reversed(messages):
-            await handle_message(msg)
+        await _process_missed_messages(reversed(messages))
         return
 
     # التشغيلات اللاحقة: فقط المنشورات الجديدة بعد آخر last_id محفوظ (بدون تكرار)
     messages = await client.get_messages(SOURCE_CHANNEL, min_id=last_id, limit=50)
     if messages:
         log.info(f"اللحاق بـ {len(messages)} رسالة فائتة (جديدة بعد last_id={last_id}).")
-    for msg in reversed(messages):
-        await handle_message(msg)
+    await _process_missed_messages(reversed(messages))
+
+
+async def _process_missed_messages(messages):
+    """
+    يعالج رسائل اللحاق بالترتيب الزمني، مع تجميع رسائل نفس الألبوم (grouped_id)
+    سوية قبل نشرها كمنشور واحد، بدل معالجة كل رسالة لحالها.
+    """
+    messages = list(messages)
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.grouped_id:
+            group_id = msg.grouped_id
+            album_msgs = [msg]
+            j = i + 1
+            while j < len(messages) and messages[j].grouped_id == group_id:
+                album_msgs.append(messages[j])
+                j += 1
+            await handle_album(album_msgs)
+            i = j
+        else:
+            await handle_message(msg)
+            i += 1
 
 
 async def main():
